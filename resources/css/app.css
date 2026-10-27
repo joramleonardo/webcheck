@@ -1,0 +1,24 @@
+@import 'tailwindcss';
+
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../storage/framework/views/*.php';
+@source "../**/*.blade.php";
+@source "../**/*.js";
+@source "../**/*.ts";
+@source "../**/*.tsx";
+
+@theme {
+    --font-sans: 'Figtree', ui-sans-serif, system-ui, sans-serif;
+
+    --color-anakiwa-50: #F1FAFE;
+    --color-anakiwa-100: #E2F3FC;
+    --color-anakiwa-200: #BFE8F8;
+    --color-anakiwa-300: #8ED8F3;
+    --color-anakiwa-400: #47C0E9;
+    --color-anakiwa-500: #1FA9D8;
+    --color-anakiwa-600: #1188B8;
+    --color-anakiwa-700: #0F6D95;
+    --color-anakiwa-800: #115C7B;
+    --color-anakiwa-900: #144C66;
+    --color-anakiwa-950: #0D3144;
+}
