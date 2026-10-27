@@ -26,6 +26,8 @@ $excludes = [
     'build_hostinger_zip.php',
     '.env',
     '.env.hostinger',
+    'public/hot',
+    'hot',
 ];
 
 // Ensure required empty storage directories are explicitly registered in ZIP

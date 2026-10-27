@@ -1,6 +1,6 @@
 -- ==============================================================
 -- WebCheck Complete Production Database Schema for Hostinger
--- Target Database: u962919458_webcheck
+-- Target Database: u962919458_webmonitoring
 -- Host: 127.0.0.1 / localhost
 -- ==============================================================
 
