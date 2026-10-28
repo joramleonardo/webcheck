@@ -186,7 +186,7 @@ export default function StatusPage({
         const timer = setInterval(() => {
             setSecondsLeft((prev) => {
                 if (prev <= 1) {
-                    triggerCheckAll();
+                    triggerRefresh(false);
                     return refreshInterval;
                 }
                 return prev - 1;
@@ -207,21 +207,31 @@ export default function StatusPage({
         setSecondsLeft(newInterval);
     };
 
-    // Immediate Check All
-    const triggerCheckAll = () => {
+    // Immediate Refresh / Reload
+    const triggerRefresh = (forceActiveCheck = false) => {
         setIsCheckingAll(true);
-        router.post(
-            '/check-all',
-            {},
-            {
+        if (forceActiveCheck && auth?.user) {
+            router.post(
+                '/check-all',
+                {},
+                {
+                    preserveScroll: true,
+                    preserveState: true,
+                    onFinish: () => {
+                        setIsCheckingAll(false);
+                        setSecondsLeft(refreshInterval);
+                    },
+                }
+            );
+        } else {
+            router.reload({
                 preserveScroll: true,
-                preserveState: true,
                 onFinish: () => {
                     setIsCheckingAll(false);
                     setSecondsLeft(refreshInterval);
                 },
-            }
-        );
+            });
+        }
     };
 
     // Render 30-bar heartbeat strip in Anakiwa styling
@@ -552,18 +562,28 @@ export default function StatusPage({
                                 </span>
                             )}
                             {site.is_pinned && (
-                                <button
-                                    type="button"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleTogglePin(site);
-                                    }}
-                                    className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-300 flex items-center space-x-1 hover:bg-amber-100 transition-colors cursor-pointer"
-                                    title="Pinned to top of category (click to unpin)"
-                                >
-                                    <Pin className="w-2.5 h-2.5 fill-amber-500 text-amber-600" />
-                                    <span>Pinned</span>
-                                </button>
+                                auth?.user ? (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleTogglePin(site);
+                                        }}
+                                        className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-300 flex items-center space-x-1 hover:bg-amber-100 transition-colors cursor-pointer"
+                                        title="Pinned to top of category (click to unpin)"
+                                    >
+                                        <Pin className="w-2.5 h-2.5 fill-amber-500 text-amber-600" />
+                                        <span>Pinned</span>
+                                    </button>
+                                ) : (
+                                    <span
+                                        className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-300 flex items-center space-x-1"
+                                        title="Pinned to top of category"
+                                    >
+                                        <Pin className="w-2.5 h-2.5 fill-amber-500 text-amber-600" />
+                                        <span>Pinned</span>
+                                    </span>
+                                )
                             )}
                         </div>
 
@@ -623,21 +643,23 @@ export default function StatusPage({
                             <span className="text-xs font-mono font-bold text-[#0D3144] w-12 text-right">
                                 {site.uptime_24h ?? 100}%
                             </span>
-                            <button
-                                type="button"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleTogglePin(site);
-                                }}
-                                title={site.is_pinned ? 'Unpin from top of group' : 'Pin to top of category group'}
-                                className={`p-1.5 rounded-lg transition-colors ${
-                                    site.is_pinned
-                                        ? 'text-amber-600 bg-amber-50 hover:bg-amber-100 border border-amber-300'
-                                        : 'text-[#144C66]/60 hover:text-amber-600 hover:bg-[#E2F3FC]'
-                                }`}
-                            >
-                                <Pin className={`w-3.5 h-3.5 ${site.is_pinned ? 'fill-amber-500' : ''}`} />
-                            </button>
+                            {auth?.user && (
+                                <button
+                                    type="button"
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleTogglePin(site);
+                                    }}
+                                    title={site.is_pinned ? 'Unpin from top of group' : 'Pin to top of category group'}
+                                    className={`p-1.5 rounded-lg transition-colors ${
+                                        site.is_pinned
+                                            ? 'text-amber-600 bg-amber-50 hover:bg-amber-100 border border-amber-300'
+                                            : 'text-[#144C66]/60 hover:text-amber-600 hover:bg-[#E2F3FC]'
+                                    }`}
+                                >
+                                    <Pin className={`w-3.5 h-3.5 ${site.is_pinned ? 'fill-amber-500' : ''}`} />
+                                </button>
+                            )}
                             <button
                                 type="button"
                                 onClick={(e) => {
@@ -836,16 +858,20 @@ export default function StatusPage({
                             </select>
                         </div>
 
-                        {/* 3. Immediate Check All */}
+                        {/* 3. Immediate Refresh / Check All */}
                         <button
                             type="button"
-                            onClick={triggerCheckAll}
+                            onClick={() => triggerRefresh(true)}
                             disabled={isCheckingAll}
                             className="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#1FA9D8] hover:bg-[#1188B8] text-white shadow-sm shadow-[#1FA9D8]/20 disabled:opacity-50 transition-all cursor-pointer no-print"
-                            title="Run immediate health checks on all monitored endpoints"
+                            title={auth?.user ? 'Run immediate health checks on all monitored endpoints' : 'Refresh live status and telemetry'}
                         >
                             <RefreshCw className={`w-3.5 h-3.5 ${isCheckingAll ? 'animate-spin' : ''}`} />
-                            <span className="hidden sm:inline">{isCheckingAll ? 'Checking...' : 'Check All'}</span>
+                            <span className="hidden sm:inline">
+                                {isCheckingAll
+                                    ? (auth?.user ? 'Checking...' : 'Refreshing...')
+                                    : (auth?.user ? 'Check All' : 'Refresh')}
+                            </span>
                         </button>
 
                         {/* Executive Briefing Copy Button */}
