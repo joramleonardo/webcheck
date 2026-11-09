@@ -82,7 +82,13 @@ class StatusPageController extends Controller
 
         $websiteIds = $websites->pluck('id');
 
+        // Only query checks within the relevant historical window (last 30 days)
+        // to prevent unbounded table scans and memory exhaustion as records accumulate.
+        $thirtyDaysAgo = $now->copy()->subDays(30);
+
         $allRecentChecks = WebsiteCheck::whereIn('website_id', $websiteIds)
+            ->where('created_at', '>=', $thirtyDaysAgo)
+            ->select(['id', 'website_id', 'is_up', 'http_code', 'response_time', 'attempts', 'was_retried', 'keyword_found', 'error', 'created_at'])
             ->orderBy('id', 'desc')
             ->get()
             ->groupBy('website_id');

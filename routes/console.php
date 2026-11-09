@@ -16,3 +16,10 @@ Schedule::command('websites:check')
     ->everyMinute()
     ->withoutOverlapping(5) // Prevents duplicate scans if a previous run is still finishing
     ->appendOutputTo(storage_path('logs/monitor.log'));
+
+/**
+ * Daily Housekeeping: Prune checks older than 90 days at midnight to keep database lean and fast.
+ */
+Schedule::command('websites:prune --days=90')
+    ->daily()
+    ->appendOutputTo(storage_path('logs/monitor.log'));
