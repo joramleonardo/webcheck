@@ -9,6 +9,7 @@ use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Inertia\Inertia;
 use Inertia\Response;
 use Throwable;
@@ -80,86 +81,156 @@ class StatusPageController extends Controller
             ->orderBy('name')
             ->get();
 
-        $websiteIds = $websites->pluck('id');
-
-        // Only query checks within the relevant historical window (last 30 days)
-        // to prevent unbounded table scans and memory exhaustion as records accumulate.
+        $websiteIds = $websites->pluck('id')->all();
         $thirtyDaysAgo = $now->copy()->subDays(30);
 
-        $allRecentChecks = WebsiteCheck::whereIn('website_id', $websiteIds)
-            ->where('created_at', '>=', $thirtyDaysAgo)
-            ->select(['id', 'website_id', 'is_up', 'http_code', 'response_time', 'attempts', 'was_retried', 'keyword_found', 'error', 'created_at'])
-            ->orderBy('id', 'desc')
+        // 1. Fetch only the last 40 checks per website for the heartbeat strip (bounded to 40 per site)
+        $recentChecksByWebsite = [];
+        foreach ($websiteIds as $wid) {
+            $recentChecksByWebsite[$wid] = WebsiteCheck::where('website_id', $wid)
+                ->select(['id', 'website_id', 'is_up', 'http_code', 'response_time', 'attempts', 'was_retried', 'keyword_found', 'error', 'created_at'])
+                ->orderByDesc('id')
+                ->limit(40)
+                ->get()
+                ->reverse()
+                ->values();
+        }
+
+        // 2. Aggregate 24h & 7d statistics directly in the database to prevent loading hundreds of thousands of rows
+        $stats24h = !empty($websiteIds) ? DB::table('website_checks')
+            ->whereIn('website_id', $websiteIds)
+            ->where('created_at', '>=', $oneDayAgo)
+            ->selectRaw('
+                website_id,
+                COUNT(*) as total_count,
+                SUM(CASE WHEN is_up = 1 THEN 1 ELSE 0 END) as up_count,
+                AVG(CASE WHEN is_up = 1 AND response_time > 0 THEN response_time ELSE NULL END) as avg_latency,
+                MIN(CASE WHEN is_up = 1 AND response_time > 0 THEN response_time ELSE NULL END) as min_latency,
+                MAX(CASE WHEN is_up = 1 AND response_time > 0 THEN response_time ELSE NULL END) as max_latency
+            ')
+            ->groupBy('website_id')
             ->get()
-            ->groupBy('website_id');
+            ->keyBy('website_id') : collect();
+
+        $stats7d = !empty($websiteIds) ? DB::table('website_checks')
+            ->whereIn('website_id', $websiteIds)
+            ->where('created_at', '>=', $sevenDaysAgo)
+            ->selectRaw('
+                website_id,
+                COUNT(*) as total_count,
+                SUM(CASE WHEN is_up = 1 THEN 1 ELSE 0 END) as up_count
+            ')
+            ->groupBy('website_id')
+            ->get()
+            ->keyBy('website_id') : collect();
+
+        // 3. Query ONLY actual downtime checks (is_up = false) in the last 30 days to build incidents
+        $downtimeChecks = !empty($websiteIds) ? DB::table('website_checks')
+            ->whereIn('website_id', $websiteIds)
+            ->where('is_up', false)
+            ->where('created_at', '>=', $thirtyDaysAgo)
+            ->select(['id', 'website_id', 'http_code', 'error', 'created_at'])
+            ->orderBy('created_at', 'asc')
+            ->get()
+            ->groupBy('website_id') : collect();
 
         $allPublicIncidents = [];
+        $incidentsByWebsite = [];
 
-        $enrichedWebsites = $websites->map(function (Website $site) use ($allRecentChecks, $oneDayAgo, $sevenDaysAgo, $now, &$allPublicIncidents) {
-            $siteChecks = $allRecentChecks->get($site->id, collect());
-
-            // Last 40 checks in chronological order
-            $recentChecks = $siteChecks->take(40)->reverse()->values();
-
-            // 24-hour calculations
-            $checks24h = $siteChecks->filter(fn ($c) => $c->created_at >= $oneDayAgo);
-            $total24h = $checks24h->count();
-            $up24h = $checks24h->where('is_up', true)->count();
-            $uptime24h = $total24h > 0
-                ? round(($up24h / $total24h) * 100, 1)
-                : ($site->last_is_up ? 100.0 : 0.0);
-
-            $successful24h = $checks24h->where('is_up', true)->where('response_time', '>', 0);
-            $avgLatency24h = $successful24h->isNotEmpty() ? (int) round($successful24h->avg('response_time')) : ($site->last_response_time ?: 0);
-            $minLatency24h = $successful24h->isNotEmpty() ? (int) $successful24h->min('response_time') : ($site->last_response_time ?: 0);
-            $maxLatency24h = $successful24h->isNotEmpty() ? (int) $successful24h->max('response_time') : ($site->last_response_time ?: 0);
-
-            // 7-day uptime calculation
-            $checks7d = $siteChecks->filter(fn ($c) => $c->created_at >= $sevenDaysAgo);
-            $total7d = $checks7d->count();
-            $up7d = $checks7d->where('is_up', true)->count();
-            $uptime7d = $total7d > 0
-                ? round(($up7d / $total7d) * 100, 1)
-                : $uptime24h;
-
-            // Incident History Calculation
-            $chronologicalChecks = $siteChecks->reverse()->values();
+        foreach ($websites as $site) {
+            $siteDownChecks = $downtimeChecks->get($site->id, collect());
             $incidents = [];
             $currentIncident = null;
 
-            foreach ($chronologicalChecks as $check) {
-                if (!$check->is_up) {
-                    if (!$currentIncident) {
+            foreach ($siteDownChecks as $check) {
+                $checkTime = Carbon::parse($check->created_at);
+
+                if (!$currentIncident) {
+                    $currentIncident = [
+                        'website_id'       => $site->id,
+                        'website_name'     => $site->name,
+                        'started_at'       => $checkTime->toIso8601String(),
+                        'ended_at'         => null,
+                        'duration_minutes' => 1,
+                        'error'            => $check->error ?: 'Unresponsive or Keyword Error',
+                        'http_code'        => $check->http_code,
+                        'is_ongoing'       => false,
+                        '_last_check_time' => $checkTime,
+                    ];
+                } else {
+                    $lastTime = $currentIncident['_last_check_time'];
+                    // If checks are within 5 minutes, consider it the same continuous incident
+                    if ($checkTime->diffInMinutes($lastTime) <= 5) {
+                        $startedAt = Carbon::parse($currentIncident['started_at']);
+                        $currentIncident['duration_minutes'] = max(1, $checkTime->diffInMinutes($startedAt));
+                        $currentIncident['_last_check_time'] = $checkTime;
+                    } else {
+                        // Conclude previous incident
+                        $startedAt = Carbon::parse($currentIncident['started_at']);
+                        $currentIncident['ended_at'] = $lastTime->copy()->addMinutes(1)->toIso8601String();
+                        $currentIncident['duration_minutes'] = max(1, $lastTime->diffInMinutes($startedAt) + 1);
+                        unset($currentIncident['_last_check_time']);
+                        $incidents[] = $currentIncident;
+                        $allPublicIncidents[] = $currentIncident;
+
+                        // Start new incident
                         $currentIncident = [
                             'website_id'       => $site->id,
                             'website_name'     => $site->name,
-                            'started_at'       => $check->created_at ? $check->created_at->toIso8601String() : null,
+                            'started_at'       => $checkTime->toIso8601String(),
                             'ended_at'         => null,
                             'duration_minutes' => 1,
-                            'error'            => $check->error ?: 'Unresponsive',
-                            'is_ongoing'       => true,
+                            'error'            => $check->error ?: 'Unresponsive or Keyword Error',
+                            'http_code'        => $check->http_code,
+                            'is_ongoing'       => false,
+                            '_last_check_time' => $checkTime,
                         ];
-                    }
-                } else {
-                    if ($currentIncident) {
-                        $endedAt = $check->created_at ?: $now;
-                        $startedAt = Carbon::parse($currentIncident['started_at']);
-                        $currentIncident['ended_at'] = $endedAt->toIso8601String();
-                        $currentIncident['duration_minutes'] = max(1, $endedAt->diffInMinutes($startedAt));
-                        $currentIncident['is_ongoing'] = false;
-                        $incidents[] = $currentIncident;
-                        $allPublicIncidents[] = $currentIncident;
-                        $currentIncident = null;
                     }
                 }
             }
 
             if ($currentIncident) {
+                $lastTime = $currentIncident['_last_check_time'];
                 $startedAt = Carbon::parse($currentIncident['started_at']);
-                $currentIncident['duration_minutes'] = max(1, $now->diffInMinutes($startedAt));
+                if ($site->last_is_up === false && $now->diffInMinutes($lastTime) <= 10) {
+                    $currentIncident['is_ongoing'] = true;
+                    $currentIncident['duration_minutes'] = max(1, $now->diffInMinutes($startedAt));
+                } else {
+                    $currentIncident['ended_at'] = $lastTime->copy()->addMinutes(1)->toIso8601String();
+                    $currentIncident['duration_minutes'] = max(1, $lastTime->diffInMinutes($startedAt) + 1);
+                }
+                unset($currentIncident['_last_check_time']);
                 $incidents[] = $currentIncident;
                 $allPublicIncidents[] = $currentIncident;
             }
+
+            $incidentsByWebsite[$site->id] = array_reverse($incidents);
+        }
+
+        $enrichedWebsites = $websites->map(function (Website $site) use ($recentChecksByWebsite, $stats24h, $stats7d, $incidentsByWebsite) {
+            $recentChecks = $recentChecksByWebsite[$site->id] ?? collect();
+            $s24 = $stats24h->get($site->id);
+            $s7 = $stats7d->get($site->id);
+
+            // 24-hour calculations
+            $total24h = $s24 ? (int) $s24->total_count : 0;
+            $up24h = $s24 ? (int) $s24->up_count : 0;
+            $uptime24h = $total24h > 0
+                ? round(($up24h / $total24h) * 100, 1)
+                : ($site->last_is_up ? 100.0 : 0.0);
+
+            $avgLatency24h = $s24 && !is_null($s24->avg_latency) ? (int) round($s24->avg_latency) : ($site->last_response_time ?: 0);
+            $minLatency24h = $s24 && !is_null($s24->min_latency) ? (int) $s24->min_latency : ($site->last_response_time ?: 0);
+            $maxLatency24h = $s24 && !is_null($s24->max_latency) ? (int) $s24->max_latency : ($site->last_response_time ?: 0);
+
+            // 7-day uptime calculation
+            $total7d = $s7 ? (int) $s7->total_count : 0;
+            $up7d = $s7 ? (int) $s7->up_count : 0;
+            $uptime7d = $total7d > 0
+                ? round(($up7d / $total7d) * 100, 1)
+                : $uptime24h;
+
+            $incidents = $incidentsByWebsite[$site->id] ?? [];
 
             $siteArray = [
                 'id'                   => $site->id,
@@ -179,6 +250,11 @@ class StatusPageController extends Controller
                 'last_response_time'   => $site->last_response_time,
                 'last_checked_at'      => $site->last_checked_at ? $site->last_checked_at->toIso8601String() : null,
                 'consecutive_failures' => $site->consecutive_failures ?? 0,
+                'ssl_valid'            => $site->ssl_valid !== null ? (bool) $site->ssl_valid : null,
+                'ssl_issuer'           => $site->ssl_issuer,
+                'ssl_expires_at'       => $site->ssl_expires_at ? $site->ssl_expires_at->toIso8601String() : null,
+                'ssl_days_remaining'   => $site->ssl_days_remaining,
+                'ssl_checked_at'       => $site->ssl_checked_at ? $site->ssl_checked_at->toIso8601String() : null,
                 'uptime_24h'           => $uptime24h,
                 'uptime_7d'            => $uptime7d,
                 'avg_latency_24h'      => $avgLatency24h,
@@ -194,10 +270,10 @@ class StatusPageController extends Controller
                         'attempts'      => $c->attempts ?? 1,
                         'was_retried'   => (bool) ($c->was_retried ?? false),
                         'error'         => $c->error,
-                        'created_at'    => $c->created_at ? $c->created_at->toIso8601String() : null,
+                        'created_at'    => $c->created_at ? (is_string($c->created_at) ? Carbon::parse($c->created_at)->toIso8601String() : $c->created_at->toIso8601String()) : null,
                     ];
                 })->all(),
-                'incidents'            => array_reverse($incidents),
+                'incidents'            => $incidents,
             ];
 
             return $siteArray;
